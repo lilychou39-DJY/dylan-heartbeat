@@ -544,6 +544,14 @@ app.post("/v1/chat/completions", async (req, reply) => {
       event: "kelivo_request",
       model: body?.model || "",
       stream: body?.stream === true,
+      // 只记参数名与思考相关字段，不含消息正文，便于排查思考开关为何不生效。
+      params: Object.keys(body || {}).filter((key) => key !== "messages"),
+      reasoning: {
+        reasoning_effort: body?.reasoning_effort,
+        reasoning: body?.reasoning,
+        thinking: body?.thinking,
+        enable_thinking: body?.enable_thinking
+      },
       messages: summarizeMessagesForLog(body?.messages || [])
     }));
 
