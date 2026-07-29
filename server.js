@@ -3,7 +3,10 @@ require("dotenv").config();
 const Fastify = require("fastify");
 const fs = require("fs-extra");
 const path = require("path");
-const { createThinkingTagRewriter } = require("./thinking_tag_rewrite");
+const {
+  createSseThinkingRewriter,
+  rewriteJsonBody
+} = require("./thinking_tag_rewrite");
 
 const DEFAULT_BODY_LIMIT_MB = 50;
 
@@ -694,7 +697,7 @@ app.post("/v1/chat/completions", async (req, reply) => {
       return reply
         .code(response.status)
         .header("Content-Type", upstreamContentType || "application/json")
-        .send(responseText);
+        .send(rewriteJsonBody(responseText));
     }
 
     if (!response.body) {
@@ -709,7 +712,7 @@ app.post("/v1/chat/completions", async (req, reply) => {
 
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
-    const rewriter = createThinkingTagRewriter();
+    const rewriter = createSseThinkingRewriter();
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;

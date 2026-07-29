@@ -1,14 +1,17 @@
-// 部分 Claude 中转站不使用 OpenAI 的 reasoning_content 字段，而是把思考块
-// 以 <thinking>...</thinking> 内联进正文。Kelivo 的解析器只认 <think> 和
-// <thought>（见 lib/features/chat/utils/thinking_tag_parser.dart），标签对不上
-// 就会把思考内容当普通文字显示出来。这里在转发时改写成它认识的标签。
+// 模型有时会把思考内容以 <thinking>...</thinking> 当作普通文字写进正文。
+// Kelivo 的解析器只认 <think> 和 <thought>（见
+// lib/features/chat/utils/thinking_tag_parser.dart），标签对不上就会原样显示。
+// 这里在转发时改写成它认识的标签，让它折叠成“思考过程”。
+//
+// 注意必须作用在 JSON 解码后的 content 上：上游会把 < 转义成 <，
+// 直接在 SSE 字节流上做字面替换是匹配不到的。
 
 const REPLACEMENTS = [
   ["</thinking>", "</think>"],
   ["<thinking>", "<think>"],
 ];
 
-// 标签可能被 SSE 分片切断，结尾要扣住可能是半个标签的部分。
+// 标签可能被切断在两个 delta 之间，结尾要扣住可能是半个标签的部分。
 const MAX_HOLD = Math.max(...REPLACEMENTS.map(([from]) => from.length)) - 1;
 
 function rewrite(text) {
@@ -35,7 +38,6 @@ function holdLength(buffer) {
 
 function createThinkingTagRewriter() {
   let pending = "";
-
   return {
     push(text) {
       if (!text) return "";
@@ -51,7 +53,110 @@ function createThinkingTagRewriter() {
       pending = "";
       return out;
     },
+    get held() {
+      return pending;
+    },
   };
 }
 
-module.exports = { createThinkingTagRewriter };
+// 对 SSE 流做逐事件改写：解析 data: 行，改写 delta.content 再重新序列化。
+function createSseThinkingRewriter() {
+  const tags = createThinkingTagRewriter();
+  let lineBuffer = "";
+  let template = null;
+
+  function extraEvent(text) {
+    const base = template
+      ? JSON.parse(JSON.stringify(template))
+      : { object: "chat.completion.chunk", choices: [] };
+    base.choices = [{ index: 0, delta: { content: text }, finish_reason: null }];
+    return "data: " + JSON.stringify(base) + "\n\n";
+  }
+
+  function transformLine(line) {
+    const body = line.endsWith("\r") ? line.slice(0, -1) : line;
+    if (!body.startsWith("data:")) return line;
+    const payload = body.slice(5).trim();
+
+    if (payload === "[DONE]") {
+      const rest = tags.flush();
+      return (rest ? extraEvent(rest) : "") + line;
+    }
+
+    let obj;
+    try {
+      obj = JSON.parse(payload);
+    } catch {
+      return line;
+    }
+    if (!Array.isArray(obj.choices)) return line;
+
+    // 结束事件之前必须把扣住的内容吐出来，否则会排在 finish 之后被丢弃。
+    const finishing = obj.choices.some((c) => c && c.finish_reason);
+    let prefix = "";
+    let changed = false;
+
+    for (const choice of obj.choices) {
+      const delta = choice && (choice.delta || choice.message);
+      if (delta && typeof delta.content === "string" && delta.content) {
+        delta.content = tags.push(delta.content);
+        changed = true;
+      }
+    }
+    if (finishing && tags.held) prefix = extraEvent(tags.flush());
+
+    template = obj;
+    return prefix + (changed ? "data: " + JSON.stringify(obj) : line);
+  }
+
+  return {
+    push(text) {
+      if (!text) return "";
+      lineBuffer += text;
+      const lines = lineBuffer.split("\n");
+      lineBuffer = lines.pop();
+      return lines.map((line) => transformLine(line) + "\n").join("");
+    },
+    flush() {
+      let out = "";
+      if (lineBuffer) {
+        out += transformLine(lineBuffer);
+        lineBuffer = "";
+      }
+      const rest = tags.flush();
+      if (rest) out += extraEvent(rest);
+      return out;
+    },
+  };
+}
+
+// 非流式响应：整包 JSON 里改写 message.content。解析失败就原样返回。
+function rewriteJsonBody(text) {
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return text;
+  }
+  if (!Array.isArray(parsed?.choices)) return text;
+
+  let changed = false;
+  for (const choice of parsed.choices) {
+    const message = choice && (choice.message || choice.delta);
+    if (message && typeof message.content === "string" && message.content) {
+      const next = rewrite(message.content);
+      if (next !== message.content) {
+        message.content = next;
+        changed = true;
+      }
+    }
+  }
+  return changed ? JSON.stringify(parsed) : text;
+}
+
+module.exports = {
+  createThinkingTagRewriter,
+  createSseThinkingRewriter,
+  rewriteJsonBody,
+  rewriteThinkingTags: rewrite,
+};
