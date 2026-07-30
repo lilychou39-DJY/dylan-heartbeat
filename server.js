@@ -7,6 +7,7 @@ const {
   createSseThinkingRewriter,
   rewriteJsonBody
 } = require("./thinking_tag_rewrite");
+const { stampLastUserMessage } = require("./timeline_stamp");
 
 const DEFAULT_BODY_LIMIT_MB = 50;
 
@@ -558,9 +559,14 @@ app.post("/v1/chat/completions", async (req, reply) => {
     const kelivoMessages = body.messages || [];
     const oldTimeline = loadTimeline();
 
+    // 只给时间线那一路补时间戳；转发给模型的 llmMessages 仍用原始 kelivoMessages。
+    // 放在时间戳记忆库之前，这样这条消息的去前缀指纹会被记下来，
+    // 以后它滚出上下文窗口也能找回原始时间。
+    const timelineMessages = stampLastUserMessage(kelivoMessages, process.env.TIME_ZONE);
+
     const tsDB = loadTimestampDB();
     let tsDBDirty = false;
-    for (const msg of kelivoMessages) {
+    for (const msg of timelineMessages) {
       if (msg.role === "system") continue;
       if (msg.role === "tool") continue;
       const ts = extractTimestamp(normalizeContentToText(msg.content));
@@ -572,7 +578,7 @@ app.post("/v1/chat/completions", async (req, reply) => {
     }
     if (tsDBDirty) saveTimestampDB(tsDB);
 
-    const finalTimeline = buildTimeline(kelivoMessages, tsDB);
+    const finalTimeline = buildTimeline(timelineMessages, tsDB);
     saveTimeline(finalTimeline);
 
     // Kelivo 发图时 content 常是数组。默认原样透传给视觉模型；
