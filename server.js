@@ -8,6 +8,7 @@ const {
   rewriteJsonBody
 } = require("./thinking_tag_rewrite");
 const { stampLastUserMessage } = require("./timeline_stamp");
+const { limitHistoricalImages } = require("./multimodal_budget");
 
 const DEFAULT_BODY_LIMIT_MB = 50;
 
@@ -583,9 +584,11 @@ app.post("/v1/chat/completions", async (req, reply) => {
 
     // Kelivo 发图时 content 常是数组。默认原样透传给视觉模型；
     // 如上游不支持图片，可设置 MULTIMODAL_MODE=text 退回文本占位。
-    const llmMessages = kelivoMessages
-      .map(prepareMessageForLLM)
-      .filter(Boolean);
+    // 历史图片每轮都会被重传，只保留最近几张，其余降级成占位符；
+    // 数量用 MULTIMODAL_RECENT_IMAGES 控制，设 all 恢复全部透传。
+    const llmMessages = limitHistoricalImages(
+      kelivoMessages.map(prepareMessageForLLM).filter(Boolean)
+    );
 
     const oldEvents = stripPosition(
       oldTimeline.filter(isSpecialEvent).sort((a, b) => {
